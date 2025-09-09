@@ -9,9 +9,10 @@ source virtual-env/bin/activate
 pip install -r requirements.txt
 ```
 
-My token:
+### My token:
 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
-Username:
+
+### Username:
 Harsheys18
 
 # Setting Up a GitHub Personal Access Token (PAT)
