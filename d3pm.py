@@ -11,12 +11,12 @@ import os
 from torch import nn
 import torch.nn.functional as F
 
-def train(model, train_loader, test_loader, run_name, learning_rate, epochs, batch_size, device, num_steps=1000):
+def train(model, train_loader, test_loader, run_name, learning_rate, epochs, batch_size, device, num_steps=1000, mask_type="linear"):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
 
     # Initialize mask scheduler
-    scheduler = MaskSchedulerD3PM(num_timesteps=num_steps, mask_type="linear")
+    scheduler = MaskSchedulerD3PM(num_timesteps=num_steps, mask_type=mask_type)
 
     model.train()
     for epoch in range(epochs):
@@ -107,6 +107,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "sample"], help="Mode: train or sample")
     # Add any other arguments you want here
+    parser.add_argument("--mask_type", type=str, default="linear", choices=["linear", "uniform", "cosine", "quadratic"], help="Type of mask schedule")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -134,12 +135,12 @@ if __name__ == "__main__":
     model = D3PM(vocab_size=256, mask_token=255, hidden_dim=512)
     model.to(device)
     
-    run_name = f"exps_d3pm/{args.epochs}ep_{args.batch_size}bs_{args.learning_rate}lr" # Change run name based on your experiments
+    run_name = f"exps_d3pm/{args.epochs}ep_{args.batch_size}bs_{args.learning_rate}lr_{args.mask_type}mt" # Change run name based on your experiments
     os.makedirs(run_name, exist_ok=True)
 
     if args.mode == "train":
         model.train()
-        train(model, train_loader, test_loader, run_name, args.learning_rate, args.epochs, args.batch_size, device)
+        train(model, train_loader, test_loader, run_name, args.learning_rate, args.epochs, args.batch_size, device, args.num_steps, args.mask_type)
     elif args.mode == "sample":
         model.load_state_dict(torch.load(f"{run_name}/model.pth"))
         model.eval()

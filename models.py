@@ -5,8 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class D3PM(nn.Module):
-    def __init__(self, vocab_size=256, mask_token=255, hidden_dim=512):
+    def __init__(self, vocab_size=256, mask_token=255, hidden_dim=512): # Add any required parameters
         super().__init__()
+        # Define your conditional model architecture here
         self.vocab_size = vocab_size
         self.mask_token = mask_token
 
