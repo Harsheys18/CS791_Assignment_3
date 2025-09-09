@@ -135,7 +135,7 @@ if __name__ == "__main__":
     model = D3PM(vocab_size=256, mask_token=255, hidden_dim=512)
     model.to(device)
     
-    run_name = f"exps_d3pm/{args.epochs}ep_{args.batch_size}bs_{args.learning_rate}lr_{args.mask_type}mt" # Change run name based on your experiments
+    run_name = f"exps_d3pm/{args.epochs}ep_{args.batch_size}bs_{args.learning_rate}lr_{args.mask_type}" # Change run name based on your experiments
     os.makedirs(run_name, exist_ok=True)
 
     if args.mode == "train":
