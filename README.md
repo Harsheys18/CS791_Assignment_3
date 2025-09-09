@@ -1,3 +1,43 @@
+# Running Code on a GPU
+
+## Setting up the environment
+```bash
+git clone https://github.com/Harsheys18/CS791_Assignment_3.git
+cd CS791_Assignment_3
+python3 -m venv virtual-env
+source virtual-env/bin/activate
+pip install -r requirements.txt
+```
+
+# Setting Up a GitHub Personal Access Token (PAT)
+
+To create a personal access token in GitHub, follow these steps:
+
+1. **Log in to GitHub**  
+   Go to [github.com](https://github.com) and log in with your account.
+
+2. **Navigate to Settings**  
+   In the upper-right corner of any GitHub page, click your profile picture and select **Settings**.
+
+3. **Access Developer Settings**  
+   In the left sidebar of the settings page, click **Developer settings**.
+
+4. **Go to Personal Access Tokens**  
+   Under **Developer settings**, click **Personal access tokens**.
+
+5. **Choose Token Type**  
+   You will see options for:  
+   - **Tokens (classic)**  
+   - **Fine-grained tokens**  
+
+   Choose the type that best suits your needs. For general use, **Tokens (classic)** is often sufficient.
+
+6. **Generate a New Token**  
+   Click **Generate new token** (or **Generate new token (classic)** if you selected classic tokens) and follow the prompts to configure permissions and expiration.
+   Save this token, and paste after running the "Setting up the environment commands".
+
+### following instructions can be ignored for now.
+
 # Environment and installations
 
 To install Miniconda, follow the steps [here](https://www.anaconda.com/docs/getting-started/miniconda/install).
