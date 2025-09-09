@@ -50,47 +50,77 @@ def train(model, train_loader, test_loader, run_name, learning_rate, epochs, bat
     torch.save(model.state_dict(), f"{run_name}/model.pth")
     print(f"Model saved to {run_name}/model.pth")
 
-def sample(model, class_label, device, num_samples=16, num_steps=1000, mask_token=255, test_loader=None, compute_fid_flag=True):
+def sample(model, device, num_samples_per_class=16, num_steps=1000, mask_token=255, test_loader=None, compute_fid_flag=True, run_name=None):
     '''
     Returns:
         torch.Tensor, shape (num_samples, 1, 28, 28)
     '''
     model.eval()
-    B = num_samples
-    x_t = torch.full((B, 28, 28), mask_token, device=device, dtype=torch.long)
-    labels = torch.full((B,), class_label, device=device, dtype=torch.long)
+    all_samples = []
 
-    scheduler = MaskSchedulerD3PM(num_timesteps=num_steps, mask_type="linear")
+    for class_label in range(10):
+        B = num_samples_per_class
+        x_t = torch.full((B, 28, 28), mask_token, device=device, dtype=torch.long)
+        labels = torch.full((B,), class_label, device=device, dtype=torch.long)
 
-    with torch.no_grad():
-        for t_inv in range(num_steps, 0, -1):
-            t_tensor = torch.full((B,), t_inv, device=device, dtype=torch.long)
-            logits = model.denoising(x_t, t_tensor, labels)   # conditional logits
-            probs = F.softmax(logits, dim=-1)
+        scheduler = MaskSchedulerD3PM(num_timesteps=num_steps, mask_type="linear")
 
-            # Sample from categorical distribution
-            pred = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(B, 28, 28)
+        # Reverse diffusion process
+        with torch.no_grad():
+            for t_inv in range(num_steps, 0, -1):
+                t_tensor = torch.full((B,), t_inv, device=device, dtype=torch.long)
+                logits = model.denoising(x_t, t_tensor, labels)
+                probs = F.softmax(logits, dim=-1)
 
-            # Fill masked positions
-            mask_positions = (x_t == mask_token)
-            x_t[mask_positions] = pred[mask_positions]
+                pred = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(B, 28, 28)
+                mask_positions = (x_t == mask_token)
+                x_t[mask_positions] = pred[mask_positions]
 
-    samples = x_t.unsqueeze(1).float() / 255.0  # (B,1,28,28)
+        samples = x_t.unsqueeze(1).float() / 255.0
+        all_samples.append(samples)
 
-    if compute_fid_flag:
-        assert test_loader is not None, "Pass test_loader when compute_fid_flag=True"
-        real_images = []
-        for batch in test_loader:
-            imgs, lbls = batch
-            imgs = imgs.float().to(device)
-            imgs = imgs / 255.0 if imgs.max() > 1.5 else imgs
-            real_images.append(imgs)
-            if sum(x.shape[0] for x in real_images) >= num_samples:
-                break
-        real_images = torch.cat(real_images, dim=0)[:num_samples]
-        fid_val = compute_fid(real_images.cpu(), samples.cpu())
-        print("FID:", fid_val)
-    return samples
+        # Compute FID for this class
+        if compute_fid_flag and test_loader is not None:
+            real_images = []
+            num_collected = 0
+
+            for batch in test_loader:
+                imgs, lbls = batch
+                mask = (lbls == class_label)
+                if mask.sum() == 0:
+                    continue
+
+                imgs_class = imgs[mask].float().to(device)
+                imgs_class = imgs_class / 255.0 if imgs_class.max() > 1.5 else imgs_class
+
+                # Only take as many images as needed
+                if num_collected + imgs_class.shape[0] > B:
+                    imgs_class = imgs_class[: B - num_collected]
+
+                real_images.append(imgs_class)
+                num_collected += imgs_class.shape[0]
+
+                if num_collected >= B:
+                    break
+
+            if num_collected < B:
+                print(f"Warning: Not enough real images for class {class_label} to compute FID. Collected {num_collected}/{B}")
+            real_images = torch.cat(real_images, dim=0)
+
+            fid_val = compute_fid(real_images.cpu(), samples.cpu())
+            print(f"Class {class_label} - FID: {fid_val:.4f}")
+
+        # Save samples per class if run_name provided
+        if run_name is not None:
+            os.makedirs(run_name, exist_ok=True)
+            torch.save(
+                samples, 
+                f"{run_name}/class_{class_label}_{num_samples_per_class}samples_{num_steps}steps.pt"
+            )
+            print(f"Saved samples for class {class_label}")
+
+    all_samples = torch.cat(all_samples, dim=0)
+    return all_samples
 
 def parse_args():
     parser = argparse.ArgumentParser(description="D3PM Model Template")
@@ -139,6 +169,13 @@ if __name__ == "__main__":
     elif args.mode == "sample":
         model.load_state_dict(torch.load(f"{run_name}/model.pth"))
         model.eval()
-        for class_num in range(10):
-            samples = sample(model, class_num, device, args.num_samples, args.num_steps)
-            torch.save(samples, f"{run_name}/{class_num}class_{args.num_samples}samples_{args.num_steps}steps.pt")
+
+        all_samples = sample(
+            model,
+            device=device,
+            num_samples_per_class=args.num_samples,
+            num_steps=args.num_steps,
+            test_loader=test_loader,
+            compute_fid_flag=True,
+            run_name=run_name  
+        )
