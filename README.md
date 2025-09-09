@@ -4,8 +4,6 @@
 ```bash
 git clone https://github.com/Harsheys18/CS791_Assignment_3.git
 cd CS791_Assignment_3
-python3 -m venv virtual-env
-source virtual-env/bin/activate
 pip install -r requirements.txt
 ```
 
