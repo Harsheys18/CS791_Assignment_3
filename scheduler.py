@@ -74,4 +74,4 @@ class MaskSchedulerD3PM:
         """
         Get mask probability for timestep t (1-indexed like in training loop).
         """
-        return self.mask_probs[t-1]
+        return self.mask_probs[(t-1).to(self.mask_probs.device)]
