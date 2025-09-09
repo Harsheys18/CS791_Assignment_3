@@ -64,3 +64,4 @@ echo "Training and Sampling Exponential masking schedule with 1500 steps..."
 python3 d3pm.py --mode train --num_steps 1500 --mask_type exponential | tee -a log.txt
 python3 d3pm.py --mode sample --num_samples 16 --num_steps 1500 --mask_type exponential | tee -a log.txt
 
+echo "All experiments completed."

@@ -3,3 +3,4 @@ torchvision
 torchmetrics
 numpy
 torch-fidelity
+tqdm
