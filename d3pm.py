@@ -9,12 +9,7 @@ import os
 
 # Add any extra imports you want here
 from torch import nn
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import os
-import random
 
 def train(model, train_loader, test_loader, run_name, learning_rate, epochs, batch_size, device, num_steps=1000):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -58,10 +53,11 @@ def train(model, train_loader, test_loader, run_name, learning_rate, epochs, bat
     print(f"Model saved to {run_name}/model.pth")
 
 
-def sample(model, device, num_samples=16, num_steps=1000, mask_token=255):
+def sample(model, device, num_samples=16, num_steps=1000, mask_token=255, test_loader=None, compute_fid_flag=True):
     '''
     Returns:
-        torch.Tensor, shape (num_samples, 1, 28, 28)
+        samples: torch.Tensor, shape (num_samples, 1, 28, 28), float in [0,1]
+        fid_score: only if compute_fid_flag=True
     '''
     model.eval()
     B = num_samples
@@ -82,7 +78,24 @@ def sample(model, device, num_samples=16, num_steps=1000, mask_token=255):
             mask_positions = (x_t == mask_token)
             x_t[mask_positions] = pred[mask_positions]
 
-    return x_t.unsqueeze(1).float() / 255.0   # (B,1,28,28)
+    samples = x_t.unsqueeze(1).float() / 255.0   # (B,1,28,28)
+
+    if compute_fid_flag:
+        assert test_loader is not None, "Pass test_loader when compute_fid_flag=True"
+        # Collect real images from test set (same count as generated)
+        real_images = []
+        for batch in test_loader:
+            imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+            imgs = imgs.float() / 255.0 if imgs.max() > 1.5 else imgs
+            real_images.append(imgs)
+            if sum(x.shape[0] for x in real_images) >= num_samples:
+                break
+        real_images = torch.cat(real_images, dim=0)[:num_samples]
+        fid_val = compute_fid(real_images, samples.cpu())
+        print("FID:", fid_val)
+        return samples
+
+    return samples
 
 
 def parse_args():
@@ -131,5 +144,5 @@ if __name__ == "__main__":
     elif args.mode == "sample":
         model.load_state_dict(torch.load(f"{run_name}/model.pth"))
         model.eval()
-        samples = sample(model, device, args.num_samples, args.num_steps, args.z_dim)
+        samples = sample(model, device, args.num_samples, args.num_steps, 255, test_loader)
         torch.save(samples, f"{run_name}/{args.num_samples}samples_{args.num_steps}steps.pt")
