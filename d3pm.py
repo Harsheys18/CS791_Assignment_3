@@ -92,8 +92,6 @@ def sample(model, device, num_samples=16, num_steps=1000, mask_token=255, test_l
         real_images = torch.cat(real_images, dim=0)[:num_samples]
         fid_val = compute_fid(real_images, samples.cpu())
         print("FID:", fid_val)
-        return samples
-
     return samples
 
 
