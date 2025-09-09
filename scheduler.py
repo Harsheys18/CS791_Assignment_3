@@ -1,4 +1,5 @@
 import torch
+import math
 
 class NoiseSchedulerDDPM():
     """
@@ -34,17 +35,9 @@ class NoiseSchedulerDDPM():
 
     def __len__(self):
         return self.num_timesteps
-    
-import torch
-
 class MaskSchedulerD3PM:
     """
     Mask scheduler for Discrete Diffusion (D3PM) models.
-
-    Args:
-        num_timesteps: int, number of timesteps in the diffusion process
-        mask_type: str, type of mask scheduling ("uniform", "linear", etc.)
-        **kwargs: additional arguments for mask scheduling
     """
 
     def __init__(self, num_timesteps=50, mask_type="linear", **kwargs):
@@ -52,26 +45,45 @@ class MaskSchedulerD3PM:
         self.mask_type = mask_type
 
         if mask_type == "linear":
-            start_prob = kwargs.get("start_prob", 1e-3)   # small noise at t=1
-            end_prob   = kwargs.get("end_prob", 0.5)      # max mask probability
-            self.init_linear_schedule(start_prob, end_prob)
+            start_prob = kwargs.get("start_prob", 1e-3)
+            end_prob   = kwargs.get("end_prob", 0.9)   # allow more corruption
+            self.mask_probs = torch.linspace(start_prob, end_prob, num_timesteps)
+
         elif mask_type == "uniform":
-            prob = kwargs.get("mask_prob", 0.25)          # fixed mask probability
+            prob = kwargs.get("mask_prob", 0.25)
             self.mask_probs = torch.full((num_timesteps,), prob)
+
+        elif mask_type == "cosine":
+            # Cosine schedule (like beta schedule in DDPMs)
+            steps = torch.arange(0, num_timesteps + 1, dtype=torch.float32)
+            alphas_cumprod = torch.cos(((steps / num_timesteps) + 0.008) / 1.008 * math.pi / 2) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            self.mask_probs = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+
+        elif mask_type == "quadratic":
+            start_prob = kwargs.get("start_prob", 1e-3)
+            end_prob   = kwargs.get("end_prob", 0.9)
+            t = torch.linspace(0, 1, num_timesteps)
+            self.mask_probs = start_prob + (end_prob - start_prob) * (t ** 2)
+
+        elif mask_type == "exponential":
+            start_prob = kwargs.get("start_prob", 1e-3)
+            end_prob   = kwargs.get("end_prob", 0.9)
+            t = torch.linspace(0, 1, num_timesteps)
+            self.mask_probs = start_prob * (end_prob / start_prob) ** t
+
         else:
             raise NotImplementedError(f"{mask_type} mask scheduler is not implemented")
-
-    def init_linear_schedule(self, start_prob, end_prob):
-        """
-        Initializes a linear mask schedule where the mask probability increases linearly.
-        """
-        self.mask_probs = torch.linspace(start_prob, end_prob, self.num_timesteps)
 
     def __len__(self):
         return self.num_timesteps
 
     def __getitem__(self, t):
         """
-        Get mask probability for timestep t (1-indexed like in training loop).
+        Get mask probability for timestep t (1-indexed).
         """
-        return self.mask_probs[(t-1).to(self.mask_probs.device)]
+        if isinstance(t, torch.Tensor):
+            t = t.to(self.mask_probs.device)
+            return self.mask_probs[t - 1]
+        else:
+            return self.mask_probs[t - 1]

@@ -16,6 +16,8 @@ class D3PM(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 28*28*vocab_size)   # logits over discrete tokens
         )
         

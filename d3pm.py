@@ -82,7 +82,6 @@ def sample(model, device, num_samples=16, num_steps=1000, mask_token=255, test_l
 
     if compute_fid_flag:
         assert test_loader is not None, "Pass test_loader when compute_fid_flag=True"
-        # Collect real images from test set (same count as generated)
         real_images = []
         for batch in test_loader:
             imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
