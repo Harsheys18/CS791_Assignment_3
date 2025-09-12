@@ -5,139 +5,260 @@ from scheduler import NoiseSchedulerDDPM
 import os
 import torch.optim as optim
 from tqdm import tqdm
+import torch
+import torch.nn as nn
+import math
+import numpy as np
+
+
+def get_timestep_embedding(timesteps, embedding_dim: int):
+    """
+    Retrieved from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py#LL90C1-L109C13
+    """
+    assert len(timesteps.shape) == 1
+
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+    emb = timesteps.type(torch.float32)[:, None] * emb[None, :]
+    emb = torch.concat([torch.sin(emb), torch.cos(emb)], axis=1)
+
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+
+    assert emb.shape == (timesteps.shape[0], embedding_dim), f"{emb.shape}"
+    return emb
+
+
+class Downsample(nn.Module):
+
+    def __init__(self, C):
+        """
+        :param C (int): number of input and output channels
+        """
+        super(Downsample, self).__init__()
+        self.conv = nn.Conv2d(C, C, 3, stride=2, padding=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.conv(x)
+        assert x.shape == (B, C, H // 2, W // 2)
+        return x
+
+
+class Upsample(nn.Module):
+
+    def __init__(self, C):
+        """
+        :param C (int): number of input and output channels
+        """
+        super(Upsample, self).__init__()
+        self.conv = nn.Conv2d(C, C, 3, stride=1, padding=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        x = nn.functional.interpolate(x, size=None, scale_factor=2, mode='nearest')
+
+        x = self.conv(x)
+        assert x.shape == (B, C, H * 2, W * 2)
+        return x
+
+
+class Nin(nn.Module):
+
+    def __init__(self, in_dim, out_dim, scale=1e-10):
+        super(Nin, self).__init__()
+
+        n = (in_dim + out_dim) / 2
+        limit = np.sqrt(3 * scale / n)
+        self.W = torch.nn.Parameter(torch.zeros((in_dim, out_dim), dtype=torch.float32
+                                                ).uniform_(-limit, limit))
+        self.b = torch.nn.Parameter(torch.zeros((1, out_dim, 1, 1), dtype=torch.float32))
+
+    def forward(self, x):
+        return torch.einsum('bchw, co->bohw', x, self.W) + self.b
+
+
+class ResNetBlock(nn.Module):
+
+    def __init__(self, in_ch, out_ch, dropout_rate=0.1):
+        super(ResNetBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1)
+        self.dense = nn.Linear(512, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1)
+
+        if not (in_ch == out_ch):
+            self.nin = Nin(in_ch, out_ch)
+
+        self.dropout_rate = dropout_rate
+        self.nonlinearity = torch.nn.SiLU()
+
+    def forward(self, x, temb):
+        """
+        :param x: (B, C, H, W)
+        :param temb: (B, dim)
+        """
+
+        h = self.nonlinearity(nn.functional.group_norm(x, num_groups=32))
+        h = self.conv1(h)
+
+        # add in timestep embedding
+        h += self.dense(self.nonlinearity(temb))[:, :, None, None]
+
+        h = self.nonlinearity(nn.functional.group_norm(h, num_groups=32))
+        h = nn.functional.dropout(h, p=self.dropout_rate)
+        h = self.conv2(h)
+
+        if not (x.shape[1] == h.shape[1]):
+            x = self.nin(x)
+
+        assert x.shape == h.shape
+        return x + h
+
+
+class AttentionBlock(nn.Module):
+
+    def __init__(self, ch):
+        super(AttentionBlock, self).__init__()
+
+        self.Q = Nin(ch, ch)
+        self.K = Nin(ch, ch)
+        self.V = Nin(ch, ch)
+
+        self.ch = ch
+
+        self.nin = Nin(ch, ch, scale=0.)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert C == self.ch
+
+        h = nn.functional.group_norm(x, num_groups=32)
+        q = self.Q(h)
+        k = self.K(h)
+        v = self.V(h)
+
+        w = torch.einsum('bchw,bcHW->bhwHW', q, k) * (int(C) ** (-0.5))  # [B, H, W, H, W]
+        w = torch.reshape(w, [B, H, W, H * W])
+        w = torch.nn.functional.softmax(w, dim=-1)
+        w = torch.reshape(w, [B, H, W, H, W])
+
+        h = torch.einsum('bhwHW,bcHW->bchw', w, v)
+        h = self.nin(h)
+
+        assert h.shape == x.shape
+        return x + h
+
 
 class Unet(nn.Module):
-    def __init__(self):
-    # Now here write a simple network that takes input a time_step value and x_t
-    # and predicts \epsilon_thetha and so i want to write a normal convolutional network
-    # and some dropout and normalisation to do this and output 
-        super().__init__()
-        self.time_dim = 64
-        self.time_mlp = nn.Sequential(
-            nn.Linear(self.time_dim, self.time_dim),
-            nn.ReLU(),
-            nn.Linear(self.time_dim, self.time_dim)
-        )
-        self.in_conv = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU()
-        )
-        
-        # Encoder (downsampling blocks)
-        self.down1 = nn.Sequential(  # To 64 -> 128, pool to 14x14
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        
-        self.down2 = nn.Sequential(  # To 128 -> 256, pool to 7x7
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        
-        # Bottleneck (at 7x7)
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.ReLU()
-        )
-        
-        # Decoder (upsampling blocks with skips and dropout)
-        self.up1 = nn.Sequential(  # Upsample 256->128, concat with skip (256 in), to 128
-            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),  # To 14x14
-            nn.Conv2d(256, 128, 3, padding=1),  # After concat
-            nn.GroupNorm(8, 128),
-            nn.ReLU(),
-            nn.Dropout2d(0.1)
-        )
-        
-        self.up2 = nn.Sequential(  # Upsample 128->64, concat with skip (128 in), to 64
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),  # To 28x28
-            nn.Conv2d(128, 64, 3, padding=1),  # After concat
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Dropout2d(0.1)
-        )
-        
-        # Output conv (predict noise)
-        self.out_conv = nn.Conv2d(64, 1, kernel_size=1)
-        self.time_proj1 = nn.Linear(self.time_dim, 64)
-        self.time_proj2 = nn.Linear(self.time_dim, 128)
-        self.time_proj3 = nn.Linear(self.time_dim, 256)
-        self.time_proj_up1 = nn.Linear(self.time_dim, 128)
-        self.time_proj_up2 = nn.Linear(self.time_dim, 64)
 
-        pass
-    def sinusoidal_embedding(self,timestep):
-        device = timestep.device
-        half_dim = self.time_dim // 2
-        embeddings = torch.log(torch.tensor(10000)) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = timestep[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+    def __init__(self, ch=128, in_ch=1):
+        super(Unet, self).__init__()
+
+        self.ch = ch
+        self.linear1 = nn.Linear(ch, 4 * ch)
+        self.linear2 = nn.Linear(4 * ch, 4 * ch)
+
+        self.conv1 = nn.Conv2d(in_ch, ch, 3, stride=1, padding=1)
+
+        self.down = nn.ModuleList([ResNetBlock(ch, 1 * ch),
+                                   ResNetBlock(1 * ch, 1 * ch),
+                                   Downsample(1 * ch),
+                                   ResNetBlock(1 * ch, 2 * ch),
+                                   AttentionBlock(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   AttentionBlock(2 * ch),
+                                   Downsample(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   Downsample(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch)])
+
+        self.middle = nn.ModuleList([ResNetBlock(2 * ch, 2 * ch),
+                                     AttentionBlock(2 * ch),
+                                     ResNetBlock(2 * ch, 2 * ch)])
+
+        self.up = nn.ModuleList([ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 ResNetBlock(3 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(3 * ch, ch),
+                                 ResNetBlock(2 * ch, ch),
+                                 ResNetBlock(2 * ch, ch)])
+
+        self.final_conv = nn.Conv2d(ch, in_ch, 3, stride=1, padding=1)
+
     def forward(self, x, t):
-        batch_size = x.shape[0]
+        """
+        :param x: (torch.Tensor) batch of images [B, C, H, W]
+        :param t: (torch.Tensor) tensor of time steps (torch.long) [B]
+        """
 
-        # Embed timestep
-        t_emb = self.sinusoidal_embedding(t)        # [batch, 64]
-        t_emb = self.time_mlp(t_emb)                # [batch, 64]
+        temb = get_timestep_embedding(t, self.ch)
+        temb = torch.nn.functional.silu(self.linear1(temb))
+        temb = self.linear2(temb)
+        assert temb.shape == (t.shape[0], self.ch * 4)
 
-        # Project to match layers
-        t1 = self.time_proj1(t_emb).view(batch_size, 64, 1, 1)
-        t2 = self.time_proj2(t_emb).view(batch_size, 128, 1, 1)
-        t3 = self.time_proj3(t_emb).view(batch_size, 256, 1, 1)
-        tu1 = self.time_proj_up1(t_emb).view(batch_size, 128, 1, 1)
-        tu2 = self.time_proj_up2(t_emb).view(batch_size, 64, 1, 1)
+        x1 = self.conv1(x)
 
-        # Encoder
-        x1 = self.in_conv(x)
-        x1 = x1 + t1
-        x1 = F.relu(x1)
+        # Down
+        x2 = self.down[0](x1, temb)
+        x3 = self.down[1](x2, temb)
+        x4 = self.down[2](x3)
+        x5 = self.down[3](x4, temb)
+        x6 = self.down[4](x5)  # Attention
+        x7 = self.down[5](x6, temb)
+        x8 = self.down[6](x7)  # Attention
+        x9 = self.down[7](x8)
+        x10 = self.down[8](x9, temb)
+        x11 = self.down[9](x10, temb)
+        x12 = self.down[10](x11)
+        x13 = self.down[11](x12, temb)
+        x14 = self.down[12](x13, temb)
 
-        x2 = self.down1(x1)
-        x2 = x2 + t2
-        x2 = F.relu(x2)
+        # Middle
+        x = self.middle[0](x14, temb)
+        x = self.middle[1](x)
+        x = self.middle[2](x, temb)
 
-        x3 = self.down2(x2)
-        x3 = x3 + t3
-        x3 = F.relu(x3)
+        # Up
+        x = self.up[0](torch.cat((x, x14), dim=1), temb)
+        x = self.up[1](torch.cat((x, x13), dim=1), temb)
+        x = self.up[2](torch.cat((x, x12), dim=1), temb)
+        x = self.up[3](x)
+        x = self.up[4](torch.cat((x, x11), dim=1), temb)
+        x = self.up[5](torch.cat((x, x10), dim=1), temb)
+        x = self.up[6](torch.cat((x, x9), dim=1), temb)
+        x = self.up[7](x)
+        x = self.up[8](torch.cat((x, x8), dim=1), temb)
+        x = self.up[9](x)
+        x = self.up[10](torch.cat((x, x6), dim=1), temb)
+        x = self.up[11](x)
+        x = self.up[12](torch.cat((x, x4), dim=1), temb)
+        x = self.up[13](x)
+        x = self.up[14](x)
+        x = self.up[15](torch.cat((x, x3), dim=1), temb)
+        x = self.up[16](torch.cat((x, x2), dim=1), temb)
+        x = self.up[17](torch.cat((x, x1), dim=1), temb)
 
-        # Bottleneck
-        x_b  = self.bottleneck(x3)
+        x = nn.functional.silu(nn.functional.group_norm(x, num_groups=32))
+        x = self.final_conv(x)
 
-        # Decoder
-        x = self.up1[0](x_b)                 # [batch, 128, 14, 14]
-        x = torch.cat([x, x2], dim=1)        # [batch, 256, 14, 14]
-        x = self.up1[1:](x)                  # [batch, 128, 14, 14]
-        x = x + tu1
-        x = F.relu(x)
-
-        x = self.up2[0](x)                   # [batch, 64, 28, 28]
-        x = torch.cat([x, x1], dim=1)        # [batch, 128, 28, 28]
-        x = self.up2[1:](x)                  # [batch, 64, 28, 28]
-        x = x + tu2
-        x = F.relu(x)
-
-        # Output
-        epsilon_theta = self.out_conv(x)     # [batch, 1, 28, 28]
-        return epsilon_theta
-
-
-
+        return x
 class D3PM(nn.Module):
     def __init__(self): 
         super().__init__()
@@ -152,7 +273,7 @@ class ConditionalD3PM(nn.Module):
 class DDPM(nn.Module):
     def __init__(self,train_loader,test_loader,run_name,learning_rate, epochs,batch_size,device,beta_start,beta_end):
         super().__init__()
-        self.Noise = NoiseSchedulerDDPM(1000,"linear",beta_start=beta_start,beta_end=beta_end)
+        self.Noise = NoiseSchedulerDDPM(1000,"linear",beta_start=beta_start,beta_end=beta_end,device=device)
         self.train_loader = train_loader
         self.test_loader  = test_loader
         self.run_name = run_name
@@ -175,9 +296,9 @@ class DDPM(nn.Module):
         """
         Computes the reverse process mean μ_θ(x_t, t) from Eq. 11.
         """
-        alpha_t = self.Noise.alphas[t].to(self.device)
-        beta_t = self.Noise.betas[t].to(self.device)
-        alpha_bar_t = self.Noise.alphas_cumprod[t].to(self.device)
+        alpha_t = self.Noise.alphas[t].to(self.device).view(-1,1,1,1)
+        beta_t = self.Noise.betas[t].to(self.device).view(-1,1,1,1)
+        alpha_bar_t = self.Noise.alphas_cumprod[t].to(self.device).view(-1,1,1,1)
         mu_theta = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * epsilon_theta)
         return mu_theta
 
@@ -216,7 +337,7 @@ class DDPM(nn.Module):
             x = mu_theta  # No z at t=0
         # Clamp to [0,1] for valid images
         x = torch.clamp(x, 0, 1)
-        return x
+        return torch.clamp(x, -1, 1)
 
     def train_model(self):
         """
@@ -247,24 +368,7 @@ class DDPM(nn.Module):
             
             avg_train_loss = running_loss / len(self.train_loader)
             print(f'Epoch {epoch+1}/{self.epochs} - Average Train Loss: {avg_train_loss:.4f}')
-            
-            # Optional validation every 5 epochs
-            # if (epoch + 1) % 5 == 0:
-            #     self.model.eval()
-            #     with torch.no_grad():
-            #         # Get one test batch
-            #         test_data, _ = next(iter(self.test_loader))
-            #         test_data = test_data.to(self.device)
-            #         # Generate pure noise and denoise (short steps for speed)
-            #         x_T = torch.randn_like(test_data)
-            #         x_0_recon = self.reverse_process(self.device, num_samples=test_data.shape[0], num_steps=50)
-            #         recon_loss = F.mse_loss(x_0_recon, test_data)
-            #         print(f'  Validation Reconstruction MSE: {recon_loss.item():.4f}')
-                
-            #     # Save checkpoint
-            #     torch.save(self.model.state_dict(), f"{self.run_name}/model_epoch_{epoch+1}.pth")
-        
-        # Save final model
+  
         torch.save(self.model.state_dict(), f"{self.run_name}/model.pth")
         print(f"Training complete. Final model saved to {self.run_name}/model.pth")
 
