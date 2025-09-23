@@ -50,7 +50,7 @@ def train(model, train_loader, test_loader, run_name, learning_rate, epochs, bat
     torch.save(model.state_dict(), f"{run_name}/model.pth")
     print(f"Model saved to {run_name}/model.pth")
 
-def sample(model, device, num_samples_per_class=16, num_steps=1000, mask_token=255, test_loader=None, compute_fid_flag=True, run_name=None):
+def sample(model, device, num_samples_per_class=1000, num_steps=1000, mask_token=255, test_loader=None, compute_fid_flag=True, run_name=None):
     '''
     Returns:
         torch.Tensor, shape (num_samples, 1, 28, 28)

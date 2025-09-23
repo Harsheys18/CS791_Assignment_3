@@ -33,7 +33,7 @@ class D3PM(nn.Module):
             x_t: noisy version of x with [MASK] applied
         """
         device = x.device
-        beta_t = beta_t.to(device)              # 🔑 move to same device
+        beta_t = beta_t.to(device)              #  move to same device
         mask = torch.rand_like(x.float(), device=device) < beta_t
         x_t = x.clone()
         x_t[mask] = self.mask_token
