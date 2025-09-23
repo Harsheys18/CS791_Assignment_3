@@ -1,0 +1,350 @@
+import torch.nn as nn
+import torch
+import torch.nn.functional as F
+from scheduler import NoiseSchedulerDDPM
+import os
+import torch.optim as optim
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import math
+import numpy as np
+
+
+def get_timestep_embedding(timesteps, embedding_dim: int):
+    """
+    Retrieved from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py#LL90C1-L109C13
+    """
+    assert len(timesteps.shape) == 1
+
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+    emb = timesteps.type(torch.float32)[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)  # Fixed: torch.cat
+
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+
+    assert emb.shape == (timesteps.shape[0], embedding_dim), f"{emb.shape}"
+    return emb
+
+
+class Downsample(nn.Module):
+    def __init__(self, C):
+        super(Downsample, self).__init__()
+        self.conv = nn.Conv2d(C, C, 3, stride=2, padding=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.conv(x)
+        return x
+
+
+class Upsample(nn.Module):
+    def __init__(self, C):
+        super(Upsample, self).__init__()
+        self.conv = nn.Conv2d(C, C, 3, stride=1, padding=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = nn.functional.interpolate(x, size=None, scale_factor=2, mode='nearest')
+        x = self.conv(x)
+        return x
+
+
+class Nin(nn.Module):
+    def __init__(self, in_dim, out_dim, scale=1e-10):
+        super(Nin, self).__init__()
+        n = (in_dim + out_dim) / 2
+        limit = np.sqrt(3 * scale / n)
+        self.W = torch.nn.Parameter(torch.zeros((in_dim, out_dim), dtype=torch.float32).uniform_(-limit, limit))
+        self.b = torch.nn.Parameter(torch.zeros((1, out_dim, 1, 1), dtype=torch.float32))
+
+    def forward(self, x):
+        return torch.einsum('bchw, co->bohw', x, self.W) + self.b
+
+
+class ResNetBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout_rate=0.1):
+        super(ResNetBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1)
+        self.dense = nn.Linear(512, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1)
+        if not (in_ch == out_ch):
+            self.nin = Nin(in_ch, out_ch)
+        self.dropout_rate = dropout_rate
+        self.nonlinearity = torch.nn.SiLU()
+
+    def forward(self, x, temb):
+        h = self.nonlinearity(nn.functional.group_norm(x, num_groups=min(32, x.shape[1] // 4)))
+        h = self.conv1(h)
+        h += self.dense(self.nonlinearity(temb))[:, :, None, None]
+        h = self.nonlinearity(nn.functional.group_norm(h, num_groups=min(32, h.shape[1] // 4)))
+        h = nn.functional.dropout(h, p=self.dropout_rate)
+        h = self.conv2(h)
+        if not (x.shape[1] == h.shape[1]):
+            x = self.nin(x)
+        assert x.shape == h.shape
+        return x + h
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, ch):
+        super(AttentionBlock, self).__init__()
+        self.Q = Nin(ch, ch)
+        self.K = Nin(ch, ch)
+        self.V = Nin(ch, ch)
+        self.ch = ch
+        self.nin = Nin(ch, ch, scale=0.)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert C == self.ch
+        h = nn.functional.group_norm(x, num_groups=min(32, C // 4))
+        q = self.Q(h)
+        k = self.K(h)
+        v = self.V(h)
+        w = torch.einsum('bchw,bcHW->bhwHW', q, k) * (int(C) ** (-0.5))
+        w = torch.reshape(w, [B, H, W, H * W])
+        w = torch.nn.functional.softmax(w, dim=-1)
+        w = torch.reshape(w, [B, H, W, H, W])
+        h = torch.einsum('bhwHW,bcHW->bchw', w, v)
+        h = self.nin(h)
+        assert h.shape == x.shape
+        return x + h
+
+
+class Unet(nn.Module):
+    def __init__(self, ch=128, in_ch=1):
+        super(Unet, self).__init__()
+        self.ch = ch
+        self.linear1 = nn.Linear(ch, 4 * ch)
+        self.linear2 = nn.Linear(4 * ch, 4 * ch)
+        self.conv1 = nn.Conv2d(in_ch, ch, 3, stride=1, padding=1)
+
+        self.down = nn.ModuleList([ResNetBlock(ch, 1 * ch),
+                                   ResNetBlock(1 * ch, 1 * ch),
+                                   Downsample(1 * ch),
+                                   ResNetBlock(1 * ch, 2 * ch),
+                                   AttentionBlock(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   AttentionBlock(2 * ch),
+                                   Downsample(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   Downsample(2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch),
+                                   ResNetBlock(2 * ch, 2 * ch)])
+
+        self.middle = nn.ModuleList([ResNetBlock(2 * ch, 2 * ch),
+                                     AttentionBlock(2 * ch),
+                                     ResNetBlock(2 * ch, 2 * ch)])
+
+        self.up = nn.ModuleList([ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 ResNetBlock(4 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 ResNetBlock(3 * ch, 2 * ch),
+                                 AttentionBlock(2 * ch),
+                                 Upsample(2 * ch),
+                                 ResNetBlock(3 * ch, ch),
+                                 ResNetBlock(2 * ch, ch),
+                                 ResNetBlock(2 * ch, ch)])
+
+        self.final_conv = nn.Conv2d(ch, in_ch, 3, stride=1, padding=1)
+
+    def forward(self, x, t):
+        """
+        :param x: (torch.Tensor) batch of images [B, C, H, W]
+        :param t: (torch.Tensor) tensor of time steps (torch.long) [B]
+        """
+        temb = get_timestep_embedding(t, self.ch)
+        temb = torch.nn.functional.silu(self.linear1(temb))
+        temb = self.linear2(temb)
+        assert temb.shape == (t.shape[0], self.ch * 4)
+
+        x1 = self.conv1(x)
+
+        # Down
+        x2 = self.down[0](x1, temb)
+        x3 = self.down[1](x2, temb)
+        x4 = self.down[2](x3)  # Downsample: 28x28 -> 14x14
+        x5 = self.down[3](x4, temb)
+        x6 = self.down[4](x5)  # Attention
+        x7 = self.down[5](x6, temb)
+        x8 = self.down[6](x7)  # Downsample: 14x14 -> 7x7
+        x9 = self.down[7](x8)
+        x10 = self.down[8](x9, temb)
+        x11 = self.down[9](x10, temb)
+        x12 = self.down[10](x11)  # Downsample: 7x7 -> 4x4
+        x13 = self.down[11](x12, temb)
+        x14 = self.down[12](x13, temb)
+
+        # Middle
+        x = self.middle[0](x14, temb)
+        x = self.middle[1](x)
+        x = self.middle[2](x, temb)
+
+        # Up
+        x = self.up[0](torch.cat((x, x14), dim=1), temb)
+        x = self.up[1](torch.cat((x, x13), dim=1), temb)
+        x = self.up[2](torch.cat((x, x12), dim=1), temb)
+        x = self.up[3](x)  # Upsample: 4x4 -> 8x8
+        # Resize x to match x11 (7x7) before concat
+        x = nn.functional.interpolate(x, size=x11.shape[2:], mode='nearest')
+        x = self.up[4](torch.cat((x, x11), dim=1), temb)
+        x = self.up[5](torch.cat((x, x10), dim=1), temb)
+        x = self.up[6](torch.cat((x, x9), dim=1), temb)
+        x = self.up[7](x)  # Upsample: 8x8 -> 16x16
+        # Resize x to match x8 (7x7) before concat
+        x = nn.functional.interpolate(x, size=x8.shape[2:], mode='nearest')
+        x = self.up[8](torch.cat((x, x8), dim=1), temb)
+        x = self.up[9](x)
+        x = self.up[10](torch.cat((x, x6), dim=1), temb)
+        x = self.up[11](x)
+        x = self.up[12](torch.cat((x, x4), dim=1), temb)
+        x = self.up[13](x)
+        # Resize x to match x3 (14x14) before concat
+        x = self.up[14](x)  # Upsample: 16x16 -> 32x32
+        x = nn.functional.interpolate(x, size=x3.shape[2:], mode='nearest')
+        x = self.up[15](torch.cat((x, x3), dim=1), temb)
+        x = self.up[16](torch.cat((x, x2), dim=1), temb)
+        x = self.up[17](torch.cat((x, x1), dim=1), temb)
+
+        x = nn.functional.silu(nn.functional.group_norm(x, num_groups=min(32, x.shape[1] // 4)))
+        x = self.final_conv(x)
+
+        return x
+class D3PM(nn.Module):
+    def __init__(self): 
+        super().__init__()
+        
+
+class ConditionalD3PM(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
+        
+
+class DDPM(nn.Module):
+    def __init__(self,train_loader,test_loader,run_name,learning_rate, epochs,batch_size,device,beta_start,beta_end):
+        super().__init__()
+        self.Noise = NoiseSchedulerDDPM(1000,"linear",beta_start=beta_start,beta_end=beta_end,device=device)
+        self.train_loader = train_loader
+        self.test_loader  = test_loader
+        self.run_name = run_name
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.device = device
+        self.model = Unet().to(device)
+        
+    def forward_process(self,x0,device):
+        batch_size = x0.shape[0]
+        t = torch.randint(0,self.Noise.num_timesteps,(batch_size,),device=device).long()
+        noise = torch.randn_like(x0).to(device)
+        sqrt_alphas = self.Noise.sqrt_alphas[t].view(-1,1,1,1)
+        sqrt_one_minus_alphas = self.Noise.sqrt_one_minus_alphas[t].view(-1,1,1,1)
+        xt = sqrt_alphas*x0 + sqrt_one_minus_alphas*noise
+        return xt,t,noise
+
+    def get_mu_theta(self, x, t, epsilon_theta):
+        """
+        Computes the reverse process mean μ_θ(x_t, t) from Eq. 11.
+        """
+        alpha_t = self.Noise.alphas[t].to(self.device).view(-1,1,1,1)
+        beta_t = self.Noise.betas[t].to(self.device).view(-1,1,1,1)
+        alpha_bar_t = self.Noise.alphas_cumprod[t].to(self.device).view(-1,1,1,1)
+        mu_theta = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * epsilon_theta)
+        return mu_theta
+
+    def reverse_process(self, device, num_samples=16, num_steps=None):
+        """
+        Implements Algorithm 2: Denoising from x_T ~ N(0, I) to x_0.
+        Args:
+            device: torch.device
+            num_samples: int, number of samples to generate (batch size)
+            num_steps: int, number of denoising steps (default: 1000)
+        Returns:
+            x_0: torch.Tensor, shape (num_samples, 1, 28, 28)
+        """
+        if num_steps is None:
+            num_steps = self.Noise.num_timesteps
+        self.model.eval()
+        with torch.no_grad():
+            # Start from pure noise x_T
+            x = torch.randn(num_samples, 1, 28, 28, device=device)
+            for t_val in range(num_steps, 0, -1):  # t from T down to 1
+                t_tensor = torch.full((num_samples,), t_val, device=device, dtype=torch.long)
+                # Predict noise ε_θ(x_t, t)
+                epsilon_theta = self.model(x, t_tensor)
+                # Compute μ_θ (Eq. 11)
+                mu_theta = self.get_mu_theta(x, t_tensor, epsilon_theta)
+                # Variance σ_t^2 = β_t
+                sigma_t = torch.sqrt(self.Noise.betas[t_val].to(device))
+                # z ~ N(0, I) if t > 1, else 0
+                z = torch.randn_like(x, device=device) if t_val > 1 else 0
+                # x_{t-1} = μ_θ + σ_t * z
+                x = mu_theta + sigma_t * z
+            # At t=0, final denoising step (no noise added)
+            t_tensor = torch.zeros((num_samples,), device=device, dtype=torch.long)
+            epsilon_theta = self.model(x, t_tensor)
+            mu_theta = self.get_mu_theta(x, t_tensor, epsilon_theta)
+            x = mu_theta  # No z at t=0
+        # Clamp to [0,1] for valid images
+        x = torch.clamp(x, 0, 1)
+        return torch.clamp(x, -1, 1)
+
+    def train_model(self):
+        """
+        Training loop using simplified MSE objective (Eq. 14).
+        Saves checkpoints every 5 epochs and final model to self.run_name.
+        """
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        os.makedirs(self.run_name, exist_ok=True)
+        
+        for epoch in range(self.epochs):
+            self.model.train()
+            running_loss = 0.0
+            progress_bar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.epochs}')
+            
+            for batch_idx, (data, _) in enumerate(progress_bar):
+                data = data.to(self.device)  # [batch_size, 1, 28, 28]
+                optimizer.zero_grad()
+                # Forward process: get xt, t, true noise
+                xt, t, noise = self.forward_process(data, self.device)
+                # Predict noise with U-Net
+                epsilon_theta = self.model(xt, t)
+                # MSE loss: ||ε - ε_θ||^2
+                loss = F.mse_loss(epsilon_theta, noise)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+                progress_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
+            
+            avg_train_loss = running_loss / len(self.train_loader)
+            print(f'Epoch {epoch+1}/{self.epochs} - Average Train Loss: {avg_train_loss:.4f}')
+  
+        torch.save(self.model.state_dict(), f"{self.run_name}/model.pth")
+        print(f"Training complete. Final model saved to {self.run_name}/model.pth")
+
+    def load_state_dict(self, path):
+        """
+        Load the U-Net state dict from file.
+        """
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        print(f"Model loaded from {path}")
+
+class ConditionalDDPM(nn.Module):
+    def __init__(self, num_classes): 
+        super().__init__()
+        self.num_classes = num_classes
